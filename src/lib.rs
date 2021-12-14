@@ -324,6 +324,7 @@ fn do_write(mut remaining: &[u8]) {
             if offset >= glen {
                 grant.commit(offset);
             } else {
+                BBQ_GRANT_W.offset.store(offset, Ordering::Relaxed);
                 unsafe { BBQ_GRANT_W.put(grant) }
             }
         } else {

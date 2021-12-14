@@ -1,0 +1,22 @@
+[package]
+authors = [
+    "James Munns <james@onevariable.com>",
+    "The Knurling-rs developers"
+]
+categories = ["embedded"]
+description = "A tool that decodes defmt-bbq usb-serial logs and prints them to the console"
+edition = "2021"
+keywords = ["knurling", "logging", "formatting"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+name = "bbq-demo-print"
+version = "0.0.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1"
+defmt-decoder = { features = ["unstable"], version = "=0.3.1" }
+log = "0.4"
+structopt = "0.3"
+serialport = "4.0.1"
