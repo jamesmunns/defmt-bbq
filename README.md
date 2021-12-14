@@ -56,6 +56,8 @@ fn main() {
 }
 ```
 
+For a more detailed end-to-end example over USB Serial, please see the project's [example folder](./examples/README.md).
+
 ## Default Feature(s)
 
 This crate has a single default feature, which enables the `encoding-rzcobs`
