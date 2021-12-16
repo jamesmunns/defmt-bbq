@@ -104,13 +104,16 @@
 
 mod consts;
 
+pub use bbqueue::Consumer;
+pub use bbqueue::Error as BBQError;
+pub type DefaultConsumer = Consumer<'static, BUF_SIZE>;
+use bbqueue::{BBBuffer, GrantW, Producer};
 use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use cortex_m::{interrupt, register};
-use bbqueue::{BBBuffer, Consumer, Producer, GrantW};
 
 /// BBQueue buffer size. Default: 1024; can be customized by setting the
 /// `DEFMT_RTT_BUFFER_SIZE` environment variable.
@@ -186,9 +189,7 @@ impl UnsafeGrantW {
             logstate::INIT_IDLE => {
                 let producer = BBQ_PRODUCER.get_mut();
                 self.offset.store(0, Ordering::Relaxed);
-                producer
-                    .grant_max_remaining(BUF_SIZE)
-                    .ok()
+                producer.grant_max_remaining(BUF_SIZE).ok()
             }
             _ => panic!("Internal Error!"),
         }
@@ -240,7 +241,7 @@ mod logstate {
 /// crate documentation.
 ///
 /// [Consumer docs]: https://docs.rs/bbqueue/latest/bbqueue/struct.Consumer.html
-pub fn init() -> Result<Consumer<'static, BUF_SIZE>, bbqueue::Error> {
+pub fn init() -> Result<DefaultConsumer, BBQError> {
     let (prod, cons) = BBQ.try_split()?;
 
     // NOTE: We are okay to treat the following as safe, as the BBQueue
