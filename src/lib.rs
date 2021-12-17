@@ -105,7 +105,9 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use cortex_m::{interrupt, register};
-use bbqueue::{BBBuffer, Consumer, Producer, GrantW};
+use bbqueue::{BBBuffer, Producer, GrantW};
+pub type Consumer = bbqueue::Consumer<'static, BUF_SIZE>;
+pub type Error = bbqueue::Error;
 
 /// BBQueue buffer size. Default: 1024; can be customized by setting the
 /// `DEFMT_RTT_BUFFER_SIZE` environment variable.
@@ -235,7 +237,7 @@ mod logstate {
 /// crate documentation.
 ///
 /// [Consumer docs]: https://docs.rs/bbqueue/latest/bbqueue/struct.Consumer.html
-pub fn init() -> Result<Consumer<'static, BUF_SIZE>, bbqueue::Error> {
+pub fn init() -> Result<Consumer, Error> {
     let (prod, cons) = BBQ.try_split()?;
 
     // NOTE: We are okay to treat the following as safe, as the BBQueue
@@ -319,10 +321,13 @@ fn do_write(mut remaining: &[u8]) {
             grant[offset..][..min].copy_from_slice(&remaining[..min]);
             offset += min;
 
+            BBQ_GRANT_W.offset.store(offset, Ordering::Relaxed);
+
             remaining = &remaining[min..];
 
             if offset >= glen {
                 grant.commit(offset);
+                BBQ_STATE.store(logstate::INIT_IDLE, Ordering::Release);
             } else {
                 unsafe { BBQ_GRANT_W.put(grant) }
             }
