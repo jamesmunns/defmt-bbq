@@ -105,11 +105,10 @@
 mod consts;
 
 use bbqueue::{BBBuffer, GrantW, Producer};
-use logstate::LATCHED_FAULT;
 use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, AtomicU8, Ordering},
 };
 use cortex_m::{interrupt, register};
 
@@ -118,6 +117,12 @@ pub enum Error {
     /// An internal latching fault has occured. No more logs will be returned.
     /// This indicates a coding error in `defmt-bbq`. Please open an issue.
     InternalLatchingFault,
+
+    /// The user attempted to log before initializing the `defmt-bbq` structure.
+    /// This is a latching fault, and not recoverable, but is not an indicator of
+    /// a failure in the library. If you see this error, please ensure that you
+    /// call `defmt-bbq::init()` before making any defmt logging statements.
+    UseBeforeInitLatchingFault,
 
     /// This indicates some potentially recoverable bbqerror (including no
     /// data currently available).
@@ -261,7 +266,7 @@ impl UnsafeGrantW {
                 producer.grant_max_remaining(BUF_SIZE).ok().map(|g| (g, 0))
             }
             _ => {
-                BBQ_STATE.store(LATCHED_FAULT, Ordering::Relaxed);
+                BBQ_STATE.store(logstate::LATCH_INTERNAL_ERROR, Ordering::Relaxed);
                 return Err(Error::InternalLatchingFault);
             },
         })
@@ -274,7 +279,7 @@ unsafe impl Sync for UnsafeGrantW {}
 static BBQ: BBBuffer<BUF_SIZE> = BBBuffer::new();
 
 // A tracking variable for ensuring state. Always valid.
-static BBQ_STATE: AtomicUsize = AtomicUsize::new(logstate::UNINIT);
+static BBQ_STATE: AtomicU8 = AtomicU8::new(logstate::UNINIT);
 
 // The producer half of the logging queue. This field is ONLY
 // valid if `init()` has been called.
@@ -289,36 +294,42 @@ mod logstate {
     // BBQ has NOT been initialized
     // BBQ_PRODUCER has NOT been initialized
     // BBQ_GRANT has NOT been initialized
-    pub const UNINIT: usize = 0;
+    pub const UNINIT: u8 = 0;
 
     // BBQ HAS been initialized
     // BBQ_PRODUCER HAS been initialized
     // BBQ_GRANT has NOT been initialized
-    pub const INIT_NO_STORED_GRANT: usize = 1;
+    pub const INIT_NO_STORED_GRANT: u8 = 1;
 
     // BBQ HAS been initialized
     // BBQ_PRODUCER HAS been initialized
     // BBQ_GRANT HAS been initialized
-    pub const INIT_GRANT_IS_STORED: usize = 2;
+    pub const INIT_GRANT_IS_STORED: u8 = 2;
+
+    // All state codes above 100 are a latching fault
 
     // A latching fault has occurred.
-    pub const LATCHED_FAULT: usize = 3;
+    pub const LATCH_INTERNAL_ERROR: u8 = 100;
+
+    // The user attempted to log before init
+    pub const LATCH_USE_BEFORE_INIT: u8 = 101;
 }
 
 #[inline]
 fn check_latch(ordering: Ordering) -> Result<(), Error> {
-    if BBQ_STATE.load(ordering) == LATCHED_FAULT {
-        Err(Error::InternalLatchingFault)
-    } else {
-        Ok(())
+    match BBQ_STATE.load(ordering) {
+        i if i < logstate::LATCH_INTERNAL_ERROR => Ok(()),
+        logstate::LATCH_USE_BEFORE_INIT => Err(Error::UseBeforeInitLatchingFault),
+        _ => Err(Error::InternalLatchingFault),
     }
 }
 
+#[inline]
 fn latch_assert_eq<T: PartialEq>(left: T, right: T) -> Result<(), Error> {
     if left == right {
         Ok(())
     } else {
-        BBQ_STATE.store(LATCHED_FAULT, Ordering::Release);
+        BBQ_STATE.store(logstate::LATCH_INTERNAL_ERROR, Ordering::Release);
         Err(Error::InternalLatchingFault)
     }
 }
@@ -363,18 +374,35 @@ unsafe impl defmt::Logger for Logger {
         let primask = register::primask::read();
         interrupt::disable();
 
-        // If we have taken the logger re-entrantly, latch an error (instead of panic'ing)
-        // NOTE: We do this AFTER the critical section to prevent races
-        if check_latch(Ordering::Relaxed).is_err() || latch_assert_eq(TAKEN.load(Ordering::Relaxed), false).is_err() {
+        let state = BBQ_STATE.load(Ordering::Relaxed);
+        let taken = TAKEN.load(Ordering::Relaxed);
+
+        let bail = match (taken, state) {
+            // Fast case: all good.
+            (false, logstate::INIT_NO_STORED_GRANT) => false,
+
+            // We tried to use before initialization. Regardless of the taken state,
+            // this is an error. We *might* be able to recover from this in the future,
+            // but it is more complicated. For now, just latch the error and signal
+            // the user
+            (_, logstate::UNINIT) => {
+                BBQ_STATE.store(logstate::LATCH_USE_BEFORE_INIT, Ordering::Relaxed);
+                true
+            }
+
+            // Either the taken flag is already set, or we are in an unexpected state
+            // on acquisition. Either way, refuse to move forward.
+            _ => {
+                BBQ_STATE.store(logstate::LATCH_INTERNAL_ERROR, Ordering::Relaxed);
+                true
+            }
+        };
+
+        if bail {
             // If we just disabled interrupts, re-enable interrupts, then return
             if primask.is_active() {
                 unsafe { interrupt::enable(); }
             }
-            return;
-        }
-
-        // Ensure the logger has been initialized, and no grant is active
-        if latch_assert_eq(BBQ_STATE.load(Ordering::Relaxed), logstate::INIT_NO_STORED_GRANT).is_err() {
             return;
         }
 
@@ -402,6 +430,7 @@ unsafe impl defmt::Logger for Logger {
         // If a grant is active, take it and commit it
         match BBQ_GRANT_W.take() {
             Ok(Some((grant, offset))) => grant.commit(offset),
+
             // If we have no grant, or an internal error, keep going. We don't
             // want to early return, as that would prevent us from re-enabling
             // interrupts
@@ -416,6 +445,7 @@ unsafe impl defmt::Logger for Logger {
     }
 
     unsafe fn write(bytes: &[u8]) {
+        // Return early to avoid the encoder having to encode bytes we are going to throw away
         if check_latch(Ordering::Relaxed).is_err() {
             return;
         }
