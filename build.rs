@@ -19,7 +19,7 @@ fn main() {
     let out_file_path = out_dir_path.join("consts.rs");
     let mut out_file = File::create(&out_file_path).unwrap();
 
-    out_file.write_all(format!("pub(crate) const BUF_SIZE: usize = {};\n", size).as_bytes()).unwrap();
+    out_file.write_all(format!("pub const BUF_SIZE: usize = {};\n", size).as_bytes()).unwrap();
 
     out_file.flush().unwrap();
 }

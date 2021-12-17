@@ -15,7 +15,7 @@ license = "MIT OR Apache-2.0"
 name = "defmt-bbq"
 readme = "README.md"
 repository = "https://github.com/jamesmunns/defmt-bbq"
-version = "0.0.2"
+version = "0.1.0"
 
 [dependencies]
 cortex-m = "0.7"
