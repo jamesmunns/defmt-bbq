@@ -88,9 +88,9 @@
 //! Licensed under either of
 //!
 //! - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-//!   http://www.apache.org/licenses/LICENSE-2.0)
+//!   <http://www.apache.org/licenses/LICENSE-2.0>)
 //!
-//! - MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+//! - MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 //!
 //! at your option.
 //!
@@ -104,10 +104,8 @@
 
 mod consts;
 
-pub use bbqueue::Consumer;
-pub use bbqueue::Error as BBQError;
-pub type DefaultConsumer = Consumer<'static, BUF_SIZE>;
 use bbqueue::{BBBuffer, GrantW, Producer};
+use logstate::LATCHED_FAULT;
 use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
@@ -115,12 +113,68 @@ use core::{
 };
 use cortex_m::{interrupt, register};
 
+#[derive(Debug, defmt::Format)]
+pub enum Error {
+    /// An internal latching fault has occured. No more logs will be returned.
+    /// This indicates a coding error in `defmt-bbq`. Please open an issue.
+    InternalLatchingFault,
+
+    /// This indicates some potentially recoverable bbqerror (including no
+    /// data currently available).
+    Bbq(BBQError),
+}
+
+impl From<BBQError> for Error {
+    fn from(other: BBQError) -> Self {
+        Error::Bbq(other)
+    }
+}
+
+/// This is the consumer type given to the user to drain the logging queue.
+///
+/// It is a re-export of the [bbqueue::Consumer](https://docs.rs/bbqueue/latest/bbqueue/struct.Consumer.html) type.
+///
+pub use bbqueue::Consumer;
+
+/// This is currently the only error type that may be returned.
+///
+/// It is a re-export of the [bbqueue::Error](https://docs.rs/bbqueue/latest/bbqueue/enum.Error.html) type.
+///
+pub use bbqueue::Error as BBQError;
+
+pub use bbqueue::{GrantR, SplitGrantR};
+
+/// A type alias of the defmt-bbq consumer.
+///
+/// This alias is useful for avoiding the lifetime and const generic bounds which
+/// are always the same, if you need to name the consumer type
+pub struct DefmtConsumer {
+    cons: Consumer<'static, BUF_SIZE>,
+}
+
+impl DefmtConsumer {
+    /// Obtains a contiguous slice of committed bytes. This slice may not
+    /// contain ALL available bytes, if the writer has wrapped around. The
+    /// remaining bytes will be available after all readable bytes are
+    /// released
+    pub fn read(&mut self) -> Result<GrantR<'static, BUF_SIZE>, Error> {
+        Ok(self.cons.read()?)
+    }
+
+    /// Obtains two disjoint slices, which are each contiguous of committed bytes.
+    /// Combined these contain all previously commited data.
+    pub fn split_read(&mut self) -> Result<SplitGrantR<'static, BUF_SIZE>, Error> {
+        Ok(self.cons.split_read()?)
+    }
+}
+
 /// BBQueue buffer size. Default: 1024; can be customized by setting the
 /// `DEFMT_RTT_BUFFER_SIZE` environment variable.
 ///
 /// Use a power of 2 for best performance.
 use crate::consts::BUF_SIZE;
 
+/// A storage structure for holding the maybe initialized producer with inner mutability
 struct UnsafeProducer {
     uc_mu_fp: UnsafeCell<MaybeUninit<Producer<'static, BUF_SIZE>>>,
 }
@@ -134,15 +188,16 @@ impl UnsafeProducer {
 
     // TODO: Could be made safe if we ensure the reference is only taken
     // once. For now, leave unsafe
-    unsafe fn get_mut(&self) -> &mut Producer<'static, BUF_SIZE> {
-        assert_eq!(logstate::INIT_IDLE, BBQ_STATE.load(Ordering::Relaxed));
+    unsafe fn get_mut(&self) -> Result<&mut Producer<'static, BUF_SIZE>, Error> {
+        latch_assert_eq(logstate::INIT_NO_STORED_GRANT, BBQ_STATE.load(Ordering::Relaxed))?;
 
         // NOTE: `UnsafeCell` and `MaybeUninit` are both `#[repr(Transparent)],
         // meaning this direct cast is acceptable
         let const_ptr: *const Producer<'static, BUF_SIZE> = self.uc_mu_fp.get().cast();
         let mut_ptr: *mut Producer<'static, BUF_SIZE> = const_ptr as *mut _;
         let ref_mut: &mut Producer<'static, BUF_SIZE> = &mut *mut_ptr;
-        ref_mut
+
+        Ok(ref_mut)
     }
 }
 
@@ -150,6 +205,11 @@ unsafe impl Sync for UnsafeProducer {}
 
 struct UnsafeGrantW {
     uc_mu_fgw: UnsafeCell<MaybeUninit<GrantW<'static, BUF_SIZE>>>,
+
+    /// Note: This stores the offset into the *current grant*, IFF a grant
+    /// is stored in BBQ_GRANT_W. If there is no grant active, or if the
+    /// grant is currently "taken" by the `do_write()` function, the value
+    /// is meaningless.
     offset: AtomicUsize,
 }
 
@@ -164,16 +224,23 @@ impl UnsafeGrantW {
     // TODO: Could be made safe if we ensure the reference is only taken
     // once. For now, leave unsafe.
     //
-    // MUST be done in a critical section.
-    unsafe fn put(&self, grant: GrantW<'static, BUF_SIZE>) {
-        assert_eq!(logstate::INIT_IDLE, BBQ_STATE.load(Ordering::Relaxed));
+    /// This function STORES
+    /// MUST be done in a critical section.
+    unsafe fn put(&self, grant: GrantW<'static, BUF_SIZE>, offset: usize) -> Result<(), Error> {
+        // Note: This also catches the "already latched" state check
+        latch_assert_eq(logstate::INIT_NO_STORED_GRANT, BBQ_STATE.load(Ordering::Relaxed))?;
+
         self.uc_mu_fgw.get().write(MaybeUninit::new(grant));
-        BBQ_STATE.store(logstate::INIT_GRANT, Ordering::Relaxed);
+        self.offset.store(offset, Ordering::Relaxed);
+        BBQ_STATE.store(logstate::INIT_GRANT_IS_STORED, Ordering::Relaxed);
+        Ok(())
     }
 
-    unsafe fn take(&self) -> Option<GrantW<'static, BUF_SIZE>> {
-        match BBQ_STATE.load(Ordering::Relaxed) {
-            logstate::INIT_GRANT => {
+    unsafe fn take(&self) -> Result<Option<(GrantW<'static, BUF_SIZE>, usize)>, Error> {
+        check_latch(Ordering::Relaxed)?;
+
+        Ok(match BBQ_STATE.load(Ordering::Relaxed) {
+            logstate::INIT_GRANT_IS_STORED => {
                 // NOTE: UnsafeCell and MaybeUninit are #[repr(Transparent)], so this
                 // cast is acceptable
                 let grant = self
@@ -182,17 +249,22 @@ impl UnsafeGrantW {
                     .cast::<GrantW<'static, BUF_SIZE>>()
                     .read();
 
-                BBQ_STATE.store(logstate::INIT_IDLE, Ordering::Relaxed);
+                BBQ_STATE.store(logstate::INIT_NO_STORED_GRANT, Ordering::Relaxed);
 
-                Some(grant)
+                Some((grant, self.offset.load(Ordering::Relaxed)))
             }
-            logstate::INIT_IDLE => {
-                let producer = BBQ_PRODUCER.get_mut();
+            logstate::INIT_NO_STORED_GRANT => {
+                let producer = BBQ_PRODUCER.get_mut()?;
+
+                // We have a new grant, reset the current grant offset back to zero
                 self.offset.store(0, Ordering::Relaxed);
-                producer.grant_max_remaining(BUF_SIZE).ok()
+                producer.grant_max_remaining(BUF_SIZE).ok().map(|g| (g, 0))
             }
-            _ => panic!("Internal Error!"),
-        }
+            _ => {
+                BBQ_STATE.store(LATCHED_FAULT, Ordering::Relaxed);
+                return Err(Error::InternalLatchingFault);
+            },
+        })
     }
 }
 
@@ -222,12 +294,33 @@ mod logstate {
     // BBQ HAS been initialized
     // BBQ_PRODUCER HAS been initialized
     // BBQ_GRANT has NOT been initialized
-    pub const INIT_IDLE: usize = 1;
+    pub const INIT_NO_STORED_GRANT: usize = 1;
 
     // BBQ HAS been initialized
     // BBQ_PRODUCER HAS been initialized
     // BBQ_GRANT HAS been initialized
-    pub const INIT_GRANT: usize = 2;
+    pub const INIT_GRANT_IS_STORED: usize = 2;
+
+    // A latching fault has occurred.
+    pub const LATCHED_FAULT: usize = 3;
+}
+
+#[inline]
+fn check_latch(ordering: Ordering) -> Result<(), Error> {
+    if BBQ_STATE.load(ordering) == LATCHED_FAULT {
+        Err(Error::InternalLatchingFault)
+    } else {
+        Ok(())
+    }
+}
+
+fn latch_assert_eq<T: PartialEq>(left: T, right: T) -> Result<(), Error> {
+    if left == right {
+        Ok(())
+    } else {
+        BBQ_STATE.store(LATCHED_FAULT, Ordering::Release);
+        Err(Error::InternalLatchingFault)
+    }
 }
 
 /// Initialize the BBQueue based global defmt sink. MUST be called before
@@ -241,7 +334,7 @@ mod logstate {
 /// crate documentation.
 ///
 /// [Consumer docs]: https://docs.rs/bbqueue/latest/bbqueue/struct.Consumer.html
-pub fn init() -> Result<DefaultConsumer, BBQError> {
+pub fn init() -> Result<DefmtConsumer, Error> {
     let (prod, cons) = BBQ.try_split()?;
 
     // NOTE: We are okay to treat the following as safe, as the BBQueue
@@ -252,9 +345,9 @@ pub fn init() -> Result<DefaultConsumer, BBQError> {
     }
 
     // MUST be done LAST
-    BBQ_STATE.store(logstate::INIT_IDLE, Ordering::Release);
+    BBQ_STATE.store(logstate::INIT_NO_STORED_GRANT, Ordering::Release);
 
-    Ok(cons)
+    Ok(DefmtConsumer { cons })
 }
 
 #[defmt::global_logger]
@@ -270,12 +363,20 @@ unsafe impl defmt::Logger for Logger {
         let primask = register::primask::read();
         interrupt::disable();
 
-        if TAKEN.load(Ordering::Relaxed) {
-            panic!("defmt logger taken reentrantly")
+        // If we have taken the logger re-entrantly, latch an error (instead of panic'ing)
+        // NOTE: We do this AFTER the critical section to prevent races
+        if check_latch(Ordering::Relaxed).is_err() || latch_assert_eq(TAKEN.load(Ordering::Relaxed), false).is_err() {
+            // If we just disabled interrupts, re-enable interrupts, then return
+            if primask.is_active() {
+                unsafe { interrupt::enable(); }
+            }
+            return;
         }
 
         // Ensure the logger has been initialized, and no grant is active
-        assert_eq!(BBQ_STATE.load(Ordering::Relaxed), logstate::INIT_IDLE);
+        if latch_assert_eq(BBQ_STATE.load(Ordering::Relaxed), logstate::INIT_NO_STORED_GRANT).is_err() {
+            return;
+        }
 
         // no need for CAS because interrupts are disabled
         TAKEN.store(true, Ordering::Relaxed);
@@ -291,13 +392,20 @@ unsafe impl defmt::Logger for Logger {
     }
 
     unsafe fn release() {
+        // Don't return early, as we may need to re-enable interrupts.
+        // `do_write` and `BBQ_GRANT_W.take()` will already early-return on
+        // a latching fault condition
+
         // safety: accessing the `static mut` is OK because we have disabled interrupts.
         ENCODER.end_frame(do_write);
 
         // If a grant is active, take it and commit it
-        if let Some(grant) = BBQ_GRANT_W.take() {
-            let offset = BBQ_GRANT_W.offset.load(Ordering::Relaxed);
-            grant.commit(offset);
+        match BBQ_GRANT_W.take() {
+            Ok(Some((grant, offset))) => grant.commit(offset),
+            // If we have no grant, or an internal error, keep going. We don't
+            // want to early return, as that would prevent us from re-enabling
+            // interrupts
+            _ => {}
         }
 
         TAKEN.store(false, Ordering::Relaxed);
@@ -308,6 +416,10 @@ unsafe impl defmt::Logger for Logger {
     }
 
     unsafe fn write(bytes: &[u8]) {
+        if check_latch(Ordering::Relaxed).is_err() {
+            return;
+        }
+
         // safety: accessing the `static mut` is OK because we have disabled interrupts.
         ENCODER.write(bytes, do_write);
     }
@@ -317,26 +429,33 @@ unsafe impl defmt::Logger for Logger {
 // then any remaining bytes will be discarded.
 fn do_write(mut remaining: &[u8]) {
     while !remaining.is_empty() {
-        if let Some(mut grant) = unsafe { BBQ_GRANT_W.take() } {
-            let mut offset = BBQ_GRANT_W.offset.load(Ordering::Relaxed);
-            let glen = grant.len();
+        match unsafe { BBQ_GRANT_W.take() } {
+            Ok(Some((mut grant, mut offset))) => {
+                let glen = grant.len();
 
-            let min = remaining.len().min(grant.len() - offset);
-            grant[offset..][..min].copy_from_slice(&remaining[..min]);
-            offset += min;
+                let min = remaining.len().min(grant.len() - offset);
+                grant[offset..][..min].copy_from_slice(&remaining[..min]);
+                offset += min;
 
-            remaining = &remaining[min..];
+                remaining = &remaining[min..];
 
-            if offset >= glen {
-                grant.commit(offset);
-            } else {
-                BBQ_GRANT_W.offset.store(offset, Ordering::Relaxed);
-                unsafe { BBQ_GRANT_W.put(grant) }
-            }
-        } else {
-            // Unable to obtain a grant. We're totally full. Sorry about
-            // the rest of those bytes
-            return;
+                if offset >= glen {
+                    grant.commit(offset);
+                } else {
+                    unsafe {
+                        // If the put failed, return early
+                        if BBQ_GRANT_W.put(grant, offset).is_err() {
+                            return;
+                        }
+                    }
+                }
+            },
+
+            // No grant available, just return. Bytes are dropped
+            Ok(None) => return,
+
+            // A latching fault is active. just return.
+            Err(_) => return,
         }
     }
 }
